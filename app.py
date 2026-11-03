@@ -56,6 +56,9 @@ def load_model():
 
 
 BUNDLE, INFO = load_model()
+if BUNDLE.get("features") != FEATURES or "ranges" not in INFO:
+    load_model.clear()                    # a model cached in memory by an older version of the app
+    BUNDLE, INFO = load_model()
 RANGES = INFO["ranges"]
 ACC = INFO["accuracy"]
 # A building from the dataset, used only by the "Fill in an example" button
