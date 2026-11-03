@@ -51,7 +51,16 @@ python train_model.py
 | Y1 | Heating Load | kWh/m² |
 | Y2 | Cooling Load | kWh/m² |
 
-**How the inputs work in the app:** in this dataset each Relative Compactness value (X1) always goes with exactly one combination of Surface Area, Wall Area, Roof Area and Overall Height (X2–X5); there are 12 such building forms. The user chooses one of these 12 forms, and X2–X5 are filled in from the dataset (shown read-only). Orientation, glazing area and glazing distribution are chosen from the dataset's own values. A glazing area of 0% always has distribution 0, and the app enforces this. No conversion formulas are used, so all 8 values the model receives are exactly as in the dataset.
+**How the inputs work in the app:** the user types in all 8 feature values for their own building. No conversion formulas are used: the model receives exactly the values entered.
+
+- **Range check (blocks the prediction):** each numeric value must lie between the smallest and largest value in the dataset (e.g. Surface Area 514.5–808.5 m²). A Random Forest cannot predict reliably outside the values it was trained on.
+- **Glazing rule (enforced):** glazing area 0 always has distribution 0; any windows need a distribution from 1 to 5, as in the dataset.
+- **Reliability notes (warnings, do not block):** the 768 buildings come from only 12 simulated building forms, two heights (3.5 m, 7.0 m) and four glazing levels. The results page tells the user when:
+  - surface area differs from wall area + 2 × roof area (walls + roof + floor). This holds for every building in the dataset, so a difference usually means a typing mistake.
+  - the height is not 3.5 m or 7.0 m. The model treats heights below 5.25 m like 3.5 m and above like 7.0 m.
+  - the glazing area is between the dataset's levels.
+  - the geometry is not one of the 12 simulated forms. The result is then an estimate based on the most similar simulated buildings.
+- **Fill in an example building:** an optional button that enters one building from the dataset, useful for a demonstration.
 
 **Units:** the UCI page does not list units. The source paper reports heating and cooling load in kWh/m², and the app displays kWh/m². The app does not convert to kWh per sq. ft. or to totals, and does not calculate electricity bills or costs.
 
@@ -70,7 +79,7 @@ Linear Regression, Decision Tree and the Random Forest heating result are reprod
 
 - **Heating and cooling load:** the Random Forest prediction for the 8 inputs, in kWh/m².
 - **Low / Moderate / High:** compares the prediction with the 768 dataset buildings: below the 25th percentile = Low, above the 75th percentile = High, otherwise Moderate. "Higher than X% of the dataset buildings" is the share of the 768 buildings with a lower load. The dataset median is shown as a reference (Heating 18.95, Cooling 22.08 kWh/m²).
-- **Design suggestions:** the app changes one design choice at a time (glazing area, glazing distribution, orientation, building form), predicts again with the same model, and shows the changes that lower heating + cooling load. It never suggests removing all windows.
+- **Design suggestions:** the app changes one design choice at a time (glazing area, glazing distribution, orientation), predicts again with the same model, and shows the changes that lower heating + cooling load. It never suggests removing all windows.
 - **Compare Buildings:** both designs go through the same model and the same calculation.
 
 **Energy cost management:** the app predicts building loads, not bills. Managers can use the predicted loads to compare design options and choose those that need less heating and cooling energy, which lowers expected energy use and cost. Actual costs depend on tariffs, equipment efficiency and usage, which are outside the dataset.

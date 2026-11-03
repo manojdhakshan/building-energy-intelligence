@@ -40,32 +40,49 @@ GLAZING_DISTRIBUTIONS = {
 }
 
 
-def form_label(f):
-    return (f"Compactness {f['X1']:.2f} – height {f['X5']:.1f} m, "
-            f"surface {f['X2']:.1f} m², wall {f['X3']:.1f} m², roof {f['X4']:.2f} m²")
-
-
-def make_row(form, orientation, glazing_area, distribution):
-    """One building as the 8 model features, in training order."""
-    return {"X1": form["X1"], "X2": form["X2"], "X3": form["X3"], "X4": form["X4"], "X5": form["X5"],
-            "X6": orientation, "X7": glazing_area, "X8": distribution}
+NUMERIC_FEATURES = ["X1", "X2", "X3", "X4", "X5", "X7"]
 
 
 def check_inputs(row, info):
-    """Return a list of problems (empty = valid). Only value combinations found in the dataset are allowed."""
+    """Return a list of problems (empty = valid). Values must be filled in and lie inside the dataset's range,
+    because a Random Forest cannot predict reliably outside the values it was trained on."""
     problems = []
-    if not any(all(abs(row[k] - f[k]) < 1e-9 for k in ("X1", "X2", "X3", "X4", "X5")) for f in info["building_forms"]):
-        problems.append("Relative compactness, surface, wall and roof area and height must match one of the 12 building forms.")
+    for k in FEATURES:
+        if row.get(k) is None:
+            problems.append(f"Please enter {k} · {FEATURE_NAMES[k]}.")
+    if problems:
+        return problems
+    for k in NUMERIC_FEATURES:
+        lo, hi = info["ranges"][k]
+        if not lo <= row[k] <= hi:
+            problems.append(f"{k} · {FEATURE_NAMES[k]} must be between {lo:g} and {hi:g} (the range in the dataset).")
     if row["X6"] not in ORIENTATIONS:
         problems.append("Orientation must be North, East, South or West.")
-    if row["X7"] not in GLAZING_AREAS:
-        problems.append("Glazing area must be 0%, 10%, 25% or 40%.")
     if row["X8"] not in GLAZING_DISTRIBUTIONS:
         problems.append("Glazing distribution must be a value from 0 to 5.")
     if (row["X7"] == 0) != (row["X8"] == 0):
-        problems.append("Glazing distribution must be '0 – No glazing' when glazing area is 0%, "
+        problems.append("Glazing distribution must be '0 – No glazing' when glazing area is 0, "
                         "and between 1 and 5 when there are windows.")
     return problems
+
+
+def reliability_notes(row, info):
+    """Plain-language notes on how close the entered building is to the simulated buildings in the dataset."""
+    notes = []
+    surface = row["X3"] + 2 * row["X4"]        # walls + roof + floor; holds for every building in the dataset
+    if abs(row["X2"] - surface) > 0.01 * surface:
+        notes.append(f"Surface area is usually wall area + roof area + floor area. With your values that is "
+                     f"{surface:.1f} m² (wall + 2 × roof), but you entered {row['X2']:.1f} m². Please check the areas.")
+    if row["X5"] not in (3.5, 7.0):
+        notes.append("The dataset only contains buildings 3.5 m or 7.0 m high, so the model treats heights below "
+                     "5.25 m like 3.5 m and heights above 5.25 m like 7.0 m.")
+    if row["X7"] not in GLAZING_AREAS:
+        notes.append("The dataset only contains glazing areas of 0, 0.10, 0.25 and 0.40, so values in between are "
+                     "estimated from the nearest of these levels.")
+    if not any(all(abs(row[k] - f[k]) < 1e-6 for k in ("X1", "X2", "X3", "X4", "X5")) for f in info["building_forms"]):
+        notes.append("This geometry is not one of the 12 simulated building forms in the dataset, so the result is "
+                     "an estimate based on the most similar simulated buildings and is less certain.")
+    return notes
 
 
 def predict_rows(bundle, rows):
@@ -93,13 +110,13 @@ def level(info, target, value):
 
 def suggestions(bundle, info, row, result):
     """Design suggestions tested with the same model: change one design choice at a time
-    and keep the changes that lower the total of heating + cooling load."""
+    (glazing area, glazing distribution, orientation) and keep the changes that lower heating + cooling load."""
     base = result["Y1"] + result["Y2"]
     options = []
 
     for glaze in GLAZING_AREAS:
-        if 0 < glaze < row["X7"]:          # never suggest removing all windows (daylight is needed)
-            options.append(("Glazing area", f"Reduce glazing area from {GLAZING_AREAS[row['X7']]} to {GLAZING_AREAS[glaze]}",
+        if 0 < glaze < row["X7"] - 1e-9:   # never suggest removing all windows (daylight is needed)
+            options.append(("Glazing area", f"Reduce glazing area from {row['X7']:.2f} to {glaze:.2f} of floor area",
                             {**row, "X7": glaze}))
     if row["X7"] > 0:
         for dist in range(1, 6):
@@ -109,10 +126,6 @@ def suggestions(bundle, info, row, result):
     for o, name in ORIENTATIONS.items():
         if o != row["X6"]:
             options.append(("Orientation", f"Orient the building to face {name}", {**row, "X6": o}))
-    for f in info["building_forms"]:
-        if f["X1"] != row["X1"]:
-            options.append(("Building form", f"Use the building form with compactness {f['X1']:.2f} "
-                            f"(height {f['X5']:.1f} m)", make_row(f, row["X6"], row["X7"], row["X8"])))
 
     preds = predict_rows(bundle, [o[2] for o in options])
     best = {}

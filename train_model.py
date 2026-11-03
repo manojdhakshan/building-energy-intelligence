@@ -47,6 +47,8 @@ info = {
     "test_buildings": int(len(X_test)),
     "accuracy": accuracy,
     "building_forms": forms,
+    # Smallest and largest value of each input in the dataset: inputs must stay inside these
+    "ranges": {k: [float(df[k].min()), float(df[k].max())] for k in FEATURES},
     # Sorted loads of all 768 buildings: used to rank a prediction against the dataset
     "all_loads": {t: sorted(df[t].round(2).tolist()) for t in TARGETS},
     "quartiles": {t: [round(df[t].quantile(q), 2) for q in (0.25, 0.5, 0.75)] for t in TARGETS},
