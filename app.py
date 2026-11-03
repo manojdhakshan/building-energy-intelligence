@@ -7,10 +7,11 @@ import subprocess
 import sys
 
 import joblib
+import pandas as pd
 import streamlit as st
 
-from building_logic import (BUILDING_TYPES, CLIMATES, CONDITIONED_SHARE, ORIENTATIONS, SHAPES,
-                            compare_level, get_benchmark, predict, suggestions)
+from building_logic import (FEATURE_NAMES, FEATURES, GLAZING_AREAS, GLAZING_DISTRIBUTIONS, ORIENTATIONS, UNIT,
+                            check_inputs, form_label, level, make_row, predict_rows, rank, suggestions)
 
 st.set_page_config(page_title="Building Energy Intelligence", page_icon="🏢", layout="centered")
 
@@ -32,7 +33,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
-@st.cache_resource(show_spinner="Training the AI model for the first time (about a minute)...")
+@st.cache_resource(show_spinner="Loading the AI model (the first start also trains it)...")
 def load_model():
     if not (os.path.exists("model.joblib") and os.path.exists("model_info.json")):
         subprocess.run([sys.executable, "train_model.py"], check=True)   # e.g. first start online
@@ -41,6 +42,8 @@ def load_model():
 
 
 BUNDLE, INFO = load_model()
+FORMS = INFO["building_forms"]
+ACC = INFO["accuracy"]
 
 PAGES = ["Home", "Building Details", "Prediction Results", "Compare Buildings"]
 if "page" not in st.session_state:
@@ -61,91 +64,84 @@ with st.sidebar:
     for p in PAGES:
         st.button(p, key=f"nav_{p}", on_click=go, args=(p,), use_container_width=True,
                   type="primary" if st.session_state.page == p else "secondary")
-    st.caption("Predictions come from a Random Forest model trained on the U.S. CBECS 2018 survey "
-               f"of {INFO['training_buildings']:,} real buildings.")
+    st.caption(f"Predictions come from a Random Forest model trained on the UCI Energy Efficiency dataset "
+               f"(ENB2012) of {INFO['dataset_buildings']} simulated residential buildings.")
 
 
 # ---------------------------------------------------------------- input form
 def building_form(prefix, defaults=None):
-    """Input fields for one building. Returns a dict of values."""
-    labels = lambda opts: [o[0] for o in opts]
-    code_of = lambda opts, label: dict(opts)[label]
-    start = {"type": BUILDING_TYPES[0][0], "area": 2000, "floors": 1, "height": 12.0, "orient": "East",
-             "climate": CLIMATES[0][0], "shape": SHAPES[3][0], "glazing": 100, "courtyard": 300,
-             "cooled": CONDITIONED_SHARE[4][0], "heated": CONDITIONED_SHARE[0][0], **(defaults or {})}
+    """Input fields for the 8 model features of one building. Returns the feature row."""
+    start = {"form": 3, "orient": 3, "glazing": 0.25, "dist": 1, **(defaults or {})}
     for name, value in start.items():          # starting values, set only once
         st.session_state.setdefault(f"{prefix}_{name}", value)
 
+    st.markdown("**Building form** – in this dataset the relative compactness fixes the surface, wall and roof "
+                "area and the height (12 building forms, all with the same volume).")
+    idx = st.selectbox(f"X1 · {FEATURE_NAMES['X1']}", range(len(FORMS)), key=f"{prefix}_form",
+                       format_func=lambda i: form_label(FORMS[i]))
+    f = FORMS[idx]
+    c1, c2, c3, c4 = st.columns(4)
+    c1.number_input(f"X2 · {FEATURE_NAMES['X2']}", value=f["X2"], disabled=True, key=f"show_{prefix}_x2_{idx}")
+    c2.number_input(f"X3 · {FEATURE_NAMES['X3']}", value=f["X3"], disabled=True, key=f"show_{prefix}_x3_{idx}")
+    c3.number_input(f"X4 · {FEATURE_NAMES['X4']}", value=f["X4"], disabled=True, key=f"show_{prefix}_x4_{idx}")
+    c4.number_input(f"X5 · {FEATURE_NAMES['X5']}", value=f["X5"], disabled=True, key=f"show_{prefix}_x5_{idx}")
+
+    st.markdown("**Orientation and windows**")
+    c1, _ = st.columns(2)
+    orient = c1.selectbox(f"X6 · {FEATURE_NAMES['X6']}", list(ORIENTATIONS), key=f"{prefix}_orient",
+                          format_func=lambda o: f"{ORIENTATIONS[o]} (code {o})")
     c1, c2 = st.columns(2)
     with c1:
-        btype = st.selectbox("Building type", labels(BUILDING_TYPES), key=f"{prefix}_type")
-        area = st.number_input("Total floor area (sq. ft.)", min_value=1001, max_value=2_000_000,
-                               step=100, key=f"{prefix}_area",
-                               help="Total area of all floors added together. The dataset covers buildings above 1,000 sq. ft.")
-        floors = st.number_input("Number of floors", min_value=1, max_value=15, step=1, key=f"{prefix}_floors")
-        height = st.number_input("Total building height (ft.)", min_value=7.0, max_value=300.0,
-                                 step=1.0, key=f"{prefix}_height")
-        orientation = st.selectbox("Main facade faces", ORIENTATIONS, key=f"{prefix}_orient")
+        glazing = st.selectbox(f"X7 · {FEATURE_NAMES['X7']}", list(GLAZING_AREAS), key=f"{prefix}_glazing",
+                               format_func=lambda g: GLAZING_AREAS[g])
+    # Dataset rule: no windows <-> distribution 0; with windows -> distribution 1 to 5
+    dist_options = [0] if glazing == 0 else [1, 2, 3, 4, 5]
+    if st.session_state[f"{prefix}_dist"] not in dist_options:
+        st.session_state[f"{prefix}_dist"] = dist_options[0]
     with c2:
-        climate = st.selectbox("Climate of the location", labels(CLIMATES), key=f"{prefix}_climate")
-        shape = st.selectbox("Building shape (ground-floor plan)", labels(SHAPES), key=f"{prefix}_shape")
-        glazing = st.number_input("Glazing area – total window & glass door area (sq. ft.)", min_value=0,
-                                  max_value=1_000_000, step=10, key=f"{prefix}_glazing")
-        courtyard = st.number_input("Courtyard area (sq. ft.)", min_value=0, max_value=1_000_000,
-                                    step=10, key=f"{prefix}_courtyard", help="Enter 0 if there is no courtyard.")
-        cooled = st.selectbox("How much of the building is air-conditioned?", labels(CONDITIONED_SHARE),
-                              key=f"{prefix}_cooled")
-        heated = st.selectbox("How much of the building is heated in winter?", labels(CONDITIONED_SHARE),
-                              key=f"{prefix}_heated")
-
-    return {"type_label": btype, "type_code": code_of(BUILDING_TYPES, btype), "area": float(area),
-            "floors": int(floors), "height": float(height), "orientation": orientation,
-            "climate_label": climate, "climate": code_of(CLIMATES, climate),
-            "shape_label": shape, "shape": code_of(SHAPES, shape),
-            "glazing": float(glazing), "courtyard": float(courtyard),
-            "cooled_pct": code_of(CONDITIONED_SHARE, cooled), "heated_pct": code_of(CONDITIONED_SHARE, heated)}
+        dist = st.selectbox(f"X8 · {FEATURE_NAMES['X8']}", dist_options, key=f"{prefix}_dist",
+                            format_func=lambda d: GLAZING_DISTRIBUTIONS[d])
+    return make_row(f, orient, glazing, dist)
 
 
-def check_inputs(b):
-    """Return a list of problems with the inputs (empty list = OK)."""
-    problems = []
-    footprint = b["area"] / b["floors"]
-    if b["height"] / b["floors"] < 7:
-        problems.append("The building height is too low for that number of floors (less than 7 ft per floor).")
-    if b["courtyard"] >= footprint:
-        problems.append("The courtyard area must be smaller than the ground-floor area "
-                        f"(about {footprint:,.0f} sq. ft.).")
-    return problems
-
-
-def analyse(b):
-    r = predict(BUNDLE, b)
-    r["typ_heat"], peer_h = get_benchmark(INFO, "heat", b["type_code"], b["climate"], b["heated_pct"])
-    r["typ_cool"], peer_c = get_benchmark(INFO, "cool", b["type_code"], b["climate"], b["cooled_pct"])
-    r["peer"] = peer_h if peer_h == peer_c else "buildings in the same climate"
-    r["heat_text"], r["heat_level"] = compare_level(r["heat"], r["typ_heat"])
-    r["cool_text"], r["cool_level"] = compare_level(r["cool"], r["typ_cool"])
+def analyse(row):
+    r = predict_rows(BUNDLE, [row])[0]
+    for t in ("Y1", "Y2"):
+        r[f"{t}_text"], r[f"{t}_level"] = level(INFO, t, r[t])
+        r[f"{t}_rank"] = rank(INFO, t, r[t])
     return r
 
 
 def overall_message(r):
-    levels = {r["heat_level"], r["cool_level"]}
+    levels = {r["Y1_level"], r["Y2_level"]}
     if "high" in levels:
-        return "high", ("This building configuration indicates **relatively higher energy requirements** "
-                        f"than typical {r['peer']}. The design suggestions below can help reduce them.")
-    if levels == {"low"} or levels == {"low", "mid"}:
-        return "low", ("This building configuration indicates **relatively lower energy requirements** "
-                       f"than typical {r['peer']}. A good starting point – the suggestions below can improve it further.")
-    return "mid", (f"This building configuration indicates **energy requirements similar to** typical {r['peer']}.")
+        return "high", ("This building configuration indicates **relatively higher energy requirements** – "
+                        "it is among the highest 25% of the dataset for at least one load. "
+                        "The design suggestions below show which changes lower the predicted loads.")
+    if levels == {"low"}:
+        return "low", ("This building configuration indicates **relatively lower energy requirements** – "
+                       "both loads are among the lowest 25% of the dataset.")
+    return "mid", ("This building configuration indicates **moderate energy requirements** – "
+                   "close to the middle of the dataset.")
 
 
-def result_card(title, icon, value, total, level, text, typical):
+def result_card(title, icon, target, r):
+    median = INFO["quartiles"][target][1]
     st.markdown(f"""<div class="card"><h4>{icon} {title}</h4>
-        <div class="big">{value:.2f} <span style="font-size:1rem;font-weight:400">kWh per sq. ft. per year</span></div>
-        <div>≈ {total:,.0f} kWh per year for the whole building</div>
-        <div style="margin:.5rem 0"><span class="tag {level}">{text}</span></div>
-        <div style="font-size:.9rem;opacity:.8">Typical for similar buildings: {typical:.2f} kWh per sq. ft.</div>
+        <div class="big">{r[target]:.2f} <span style="font-size:1rem;font-weight:400">{UNIT}</span></div>
+        <div style="margin:.5rem 0"><span class="tag {r[target + '_level']}">{r[target + '_text']}</span></div>
+        <div>Higher than {r[target + '_rank']:.0f}% of the {INFO['dataset_buildings']} dataset buildings</div>
+        <div style="font-size:.9rem;opacity:.8">Dataset median: {median:.2f} {UNIT}</div>
         </div>""", unsafe_allow_html=True)
+
+
+def feature_table(row):
+    shown = {FEATURE_NAMES[k]: row[k] for k in FEATURES}
+    shown[FEATURE_NAMES["X6"]] = f"{ORIENTATIONS[row['X6']]} ({row['X6']})"
+    shown[FEATURE_NAMES["X7"]] = f"{row['X7']:.2f}"
+    shown[FEATURE_NAMES["X8"]] = GLAZING_DISTRIBUTIONS[row["X8"]]
+    return pd.DataFrame({"Feature": [f"{k} · {FEATURE_NAMES[k]}" for k in FEATURES],
+                         "Value": [str(v) for v in shown.values()]})
 
 
 # ---------------------------------------------------------------- pages
@@ -153,30 +149,32 @@ page = st.session_state.page
 
 if page == "Home":
     st.markdown("""<div class="hero"><h1>Building Energy Intelligence</h1>
-        <p>AI-based prediction of building heating and cooling energy for better energy cost management
+        <p>AI-based prediction of building heating and cooling loads to support energy cost management
         and sustainable design decisions.</p></div>""", unsafe_allow_html=True)
     st.write("")
     c1, c2, c3 = st.columns(3)
-    c1.markdown('<div class="card"><h4>1. Enter details</h4>Area, height, glazing, shape, courtyard and building type.</div>', unsafe_allow_html=True)
-    c2.markdown('<div class="card"><h4>2. AI analyses</h4>A Random Forest model trained on real building survey data.</div>', unsafe_allow_html=True)
-    c3.markdown('<div class="card"><h4>3. Get results</h4>Heating and cooling energy, a clear rating and design suggestions.</div>', unsafe_allow_html=True)
+    c1.markdown('<div class="card"><h4>1. Enter details</h4>Building form, orientation, glazing area and glazing distribution.</div>', unsafe_allow_html=True)
+    c2.markdown('<div class="card"><h4>2. AI analyses</h4>A Random Forest model trained on the UCI Energy Efficiency dataset.</div>', unsafe_allow_html=True)
+    c3.markdown('<div class="card"><h4>3. Get results</h4>Heating and cooling load, a clear rating and model-tested design suggestions.</div>', unsafe_allow_html=True)
     st.write("")
     st.button("Start Prediction  →", type="primary", on_click=go, args=("Building Details",), use_container_width=True)
-    st.caption("Results show predicted energy use (kWh), not electricity bills. They are estimates to support "
-               "early design decisions and comparison between options.")
+    st.caption(f"The model was trained on the UCI Energy Efficiency dataset (ENB2012): {INFO['dataset_buildings']} "
+               "simulated residential building configurations. Results are heating and cooling loads in kWh/m², "
+               "not electricity bills or costs. Lower predicted loads point to designs with lower energy demand, "
+               "which is how the tool supports energy cost management decisions.")
 
 elif page == "Building Details":
     st.title("Building Details")
-    st.write("Enter the basic details of the building. All fields can be changed later.")
-    b = building_form("main")
+    st.write("Choose the building's design. The app uses exactly the 8 features the model was trained on (X1–X8).")
+    row = building_form("main")
     if st.button("Predict Energy Performance", type="primary", use_container_width=True):
-        problems = check_inputs(b)
+        problems = check_inputs(row, INFO)
         if problems:
             for p in problems:
                 st.error(p)
         else:
-            st.session_state.building = b
-            st.session_state.result = analyse(b)
+            st.session_state.building = row
+            st.session_state.result = analyse(row)
             go("Prediction Results")
             st.rerun()
 
@@ -186,37 +184,46 @@ elif page == "Prediction Results":
         st.info("No prediction yet. Please enter your building details first.")
         st.button("Go to Building Details", type="primary", on_click=go, args=("Building Details",))
     else:
-        b, r = st.session_state.building, st.session_state.result
-        st.caption(f"{b['type_label']} · {b['area']:,.0f} sq. ft. · {b['floors']} floor(s) · "
-                   f"{b['height']:.0f} ft high · faces {b['orientation']} · {b['shape_label']}")
+        row, r = st.session_state.building, st.session_state.result
+        st.caption(f"Compactness {row['X1']:.2f} · height {row['X5']:.1f} m · faces {ORIENTATIONS[row['X6']]} · "
+                   f"glazing {GLAZING_AREAS[row['X7']]} · distribution {GLAZING_DISTRIBUTIONS[row['X8']]}")
         c1, c2 = st.columns(2)
         with c1:
-            result_card("Heating energy", "🔥", r["heat"], r["heat_total"], r["heat_level"], r["heat_text"], r["typ_heat"])
+            result_card("Heating load", "🔥", "Y1", r)
         with c2:
-            result_card("Cooling energy", "❄️", r["cool"], r["cool_total"], r["cool_level"], r["cool_text"], r["typ_cool"])
+            result_card("Cooling load", "❄️", "Y2", r)
 
         st.subheader("Energy performance interpretation")
-        level, msg = overall_message(r)
-        {"high": st.warning, "low": st.success, "mid": st.info}[level](msg)
-        st.write(f"Window glass covers about **{r['glass_pct']:.0f}%** of the outer walls "
-                 "(estimated from your glazing area and building size).")
+        lvl, msg = overall_message(r)
+        {"high": st.warning, "low": st.success, "mid": st.info}[lvl](msg)
 
         st.subheader("Suggestions to improve energy performance")
-        for title, text in suggestions(b, r, r["heat_level"], r["cool_level"]):
-            st.markdown(f"**{title}:** {text}")
+        tips = suggestions(BUNDLE, INFO, row, r)
+        if tips:
+            st.write("Each suggestion changes **one** design choice and is tested with the same AI model:")
+            for group, text, saving, pct, p in tips:
+                st.markdown(f"**{group}:** {text} → predicted heating {p['Y1']:.2f} and cooling {p['Y2']:.2f} {UNIT} "
+                            f"(combined load about **{pct:.0f}% lower**).")
+        else:
+            st.success("No single change of building form, orientation, glazing area or distribution lowers the "
+                       "predicted loads further – this is already one of the best configurations in the dataset.")
+
+        with st.expander("Input features used by the model"):
+            st.table(feature_table(row))
 
         with st.expander("About this prediction"):
-            acc = INFO["accuracy"]
             st.write(f"""
-- The model was trained on **{INFO['training_buildings']:,} real non-residential and residential-type buildings**
-  from the U.S. Commercial Buildings Energy Consumption Survey (CBECS 2018).
-- Model inputs: building type, floor area, floors, floor height, glass percentage, building shape (incl. courtyard),
-  climate, and share of the building heated / air-conditioned.
-- **Orientation and courtyard size are not in the dataset**. They are used only for the design suggestions.
-- Accuracy on buildings the model had not seen: cooling R² = {acc['Cooling']['r2']}, heating R² = {acc['Heating']['r2']}.
-  Cooling predictions are more reliable than heating predictions, because heating also depends on the
-  fuel and equipment used, which are not asked here.
-- Results are energy estimates (kWh), not electricity bills. Use them to compare design options.
+- **Dataset:** UCI Energy Efficiency dataset (ENB2012, Tsanas & Xifara, 2012) – **{INFO['dataset_buildings']} simulated**
+  residential building configurations (12 building forms × 4 orientations × 16 glazing options), not measured buildings.
+- **Model:** Random Forest Regression, one model for Heating Load (Y1) and one for Cooling Load (Y2),
+  trained on 80% of the data (random_state = 42) and tested on the other {INFO['test_buildings']} buildings.
+- **Accuracy on the test buildings:** Heating R² = {ACC['Y1']['r2']}, Cooling R² = {ACC['Y2']['r2']}
+  (average error {ACC['Y1']['mae']} and {ACC['Y2']['mae']} {UNIT}).
+- **Units:** {UNIT} – the heating and cooling load per square metre of floor area, as reported in the dataset's source paper.
+- **"Low / Moderate / High"** compares the prediction with the {INFO['dataset_buildings']} dataset buildings
+  (lowest 25%, middle 50%, highest 25%).
+- The app does **not** calculate electricity bills or money savings. For energy cost management, a lower
+  predicted load indicates a design that needs less heating and cooling energy.
 """)
         c1, c2 = st.columns(2)
         c1.button("← Edit details", on_click=go, args=("Building Details",), use_container_width=True)
@@ -224,34 +231,35 @@ elif page == "Prediction Results":
 
 elif page == "Compare Buildings":
     st.title("Compare Buildings")
-    st.write("Enter two building designs to see which needs less heating and cooling energy.")
+    st.write("Enter two building designs to see which has the lower predicted heating and cooling load.")
     tab_a, tab_b = st.tabs(["Building A", "Building B"])
     with tab_a:
         a = building_form("cmpA")
     with tab_b:
-        bb = building_form("cmpB", {"glazing": 400, "orient": "West", "courtyard": 0, "shape": SHAPES[0][0]})
+        b = building_form("cmpB", {"form": 8, "orient": 4, "glazing": 0.10, "dist": 4})
     if st.button("Compare Energy Performance", type="primary", use_container_width=True):
-        problems = [f"Building A: {p}" for p in check_inputs(a)] + [f"Building B: {p}" for p in check_inputs(bb)]
+        problems = [f"Building A: {p}" for p in check_inputs(a, INFO)] + [f"Building B: {p}" for p in check_inputs(b, INFO)]
         if problems:
             for p in problems:
                 st.error(p)
         else:
-            st.session_state.compare = (a, analyse(a), bb, analyse(bb))
+            ra, rb = predict_rows(BUNDLE, [a, b])        # same model, same calculation for both
+            st.session_state.compare = (ra, rb)
     if "compare" in st.session_state:
-        a, ra, bb, rb = st.session_state.compare
+        ra, rb = st.session_state.compare
         st.subheader("Results")
         c1, c2 = st.columns(2)
         for col, name, r in [(c1, "Building A", ra), (c2, "Building B", rb)]:
             with col:
                 st.markdown(f"#### {name}")
-                st.metric("🔥 Heating (kWh per sq. ft. per year)", f"{r['heat']:.2f}")
-                st.metric("❄️ Cooling (kWh per sq. ft. per year)", f"{r['cool']:.2f}")
-                st.metric("Total heating + cooling (kWh per year)", f"{r['heat_total'] + r['cool_total']:,.0f}")
-        ia, ib = ra["heat"] + ra["cool"], rb["heat"] + rb["cool"]
-        if abs(ia - ib) < 0.05 * max(ia, ib, 0.01):
-            st.info("Both designs have **similar** predicted heating and cooling energy per sq. ft.")
+                st.metric(f"🔥 Heating load ({UNIT})", f"{r['Y1']:.2f}")
+                st.metric(f"❄️ Cooling load ({UNIT})", f"{r['Y2']:.2f}")
+                st.metric(f"Heating + cooling ({UNIT})", f"{r['Y1'] + r['Y2']:.2f}")
+        ia, ib = ra["Y1"] + ra["Y2"], rb["Y1"] + rb["Y2"]
+        if abs(ia - ib) < 0.05 * max(ia, ib):
+            st.info("Both designs have **similar** predicted heating and cooling loads (less than 5% apart).")
         else:
             better, worse = ("A", "B") if ia < ib else ("B", "A")
             diff = 100 * abs(ia - ib) / max(ia, ib)
-            st.success(f"**Building {better}** needs about **{diff:.0f}% less** heating and cooling energy "
-                       f"per sq. ft. than Building {worse}.")
+            st.success(f"**Building {better}** has about **{diff:.0f}% lower** combined heating and cooling load "
+                       f"than Building {worse}.")

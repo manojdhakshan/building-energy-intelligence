@@ -1,226 +1,124 @@
 """
 Shared logic used by both the training script and the app:
-dropdown options, conversion of client inputs into model inputs,
-result interpretation and design suggestions.
-"""
-import math
+the 8 model features, dropdown options, input checks, prediction,
+comparison with the dataset and design suggestions.
 
-import numpy as np
+Feature meanings and codes follow the dataset's source paper:
+Tsanas, A. & Xifara, A. (2012). Accurate quantitative estimation of energy performance
+of residential buildings using statistical machine learning tools. Energy and Buildings, 49, 560-567.
+"""
+import bisect
+
 import pandas as pd
 
-KBTU_TO_KWH = 0.29307107
+# Model features, in the exact order used for training
+FEATURES = ["X1", "X2", "X3", "X4", "X5", "X6", "X7", "X8"]
+TARGETS = ["Y1", "Y2"]
 
-# (label shown to user, CBECS building activity code)
-BUILDING_TYPES = [
-    ("Institutional – School / college / university", 14),
-    ("Institutional – Hospital (inpatient)", 16),
-    ("Institutional – Clinic / outpatient health care", 8),
-    ("Institutional – Public order & safety (police, fire station)", 7),
-    ("Institutional – Religious building", 12),
-    ("Institutional – Public assembly (auditorium, library, community hall)", 13),
-    ("Commercial – Office", 2),
-    ("Commercial – Retail shop / showroom", 25),
-    ("Commercial – Shopping centre / mall", 23),
-    ("Commercial – Grocery / food store", 6),
-    ("Commercial – Restaurant / food service", 15),
-    ("Commercial – Warehouse / storage (not refrigerated)", 5),
-    ("Commercial – Service (repair shop, salon, dry cleaner)", 26),
-    ("Residential-type – Hotel / hostel / dormitory", 18),
-    ("Residential-type – Nursing home / assisted living", 17),
-]
+FEATURE_NAMES = {
+    "X1": "Relative Compactness",
+    "X2": "Surface Area (m²)",
+    "X3": "Wall Area (m²)",
+    "X4": "Roof Area (m²)",
+    "X5": "Overall Height (m)",
+    "X6": "Orientation",
+    "X7": "Glazing Area (share of floor area)",
+    "X8": "Glazing Area Distribution",
+}
+TARGET_NAMES = {"Y1": "Heating Load", "Y2": "Cooling Load"}
+UNIT = "kWh/m²"
 
-CLIMATES = [
-    ("Hot or very hot (most of India, Middle East, South-East Asia)", 5),
-    ("Warm (e.g. Bengaluru-like mild-warm, southern USA)", 4),
-    ("Mixed mild (e.g. hill towns at moderate altitude, central USA)", 3),
-    ("Cool (e.g. northern Europe, northern USA)", 2),
-    ("Cold or very cold (e.g. Himalayan regions, Canada)", 1),
-]
-
-SHAPES = [
-    ("Square", 1),
-    ("Wide rectangle", 2),
-    ("Narrow rectangle", 3),
-    ("Rectangle or square with an interior courtyard", 4),
-    ("H-shaped", 5),
-    ("U-shaped", 6),
-    ("E-shaped", 7),
-    ("T-shaped", 8),
-    ("L-shaped", 9),
-    ("Cross (+) shaped", 10),
-    ("Other shape", 11),
-]
-
-CONDITIONED_SHARE = [
-    ("None (0%)", 0),
-    ("Small part (about 25%)", 25),
-    ("About half (50%)", 50),
-    ("Most of it (about 75%)", 75),
-    ("All of it (100%)", 100),
-]
-
-ORIENTATIONS = ["North", "North-East", "East", "South-East", "South", "South-West", "West", "North-West"]
-
-TYPE_CODES = [code for _, code in BUILDING_TYPES]
-SHAPE_CODES = [code for _, code in SHAPES]
-FEATURES = (["area_log", "floors", "ceiling", "glass_band", "climate", "heated_pct", "cooled_pct"]
-            + [f"type_{c}" for c in TYPE_CODES] + [f"shape_{c}" for c in SHAPE_CODES])
+ORIENTATIONS = {2: "North", 3: "East", 4: "South", 5: "West"}
+GLAZING_AREAS = {0.0: "0% (no windows)", 0.10: "10%", 0.25: "25%", 0.40: "40%"}
+GLAZING_DISTRIBUTIONS = {
+    0: "0 – No glazing",
+    1: "1 – Uniform (25% on each side)",
+    2: "2 – Mostly North (55% north, 15% on other sides)",
+    3: "3 – Mostly East (55% east, 15% on other sides)",
+    4: "4 – Mostly South (55% south, 15% on other sides)",
+    5: "5 – Mostly West (55% west, 15% on other sides)",
+}
 
 
-def make_features(df):
-    """Turn a table with columns type_code, climate, area, shape, glass_band, floors, ceiling,
-    heated_pct, cooled_pct into the exact columns the model was trained on."""
-    X = pd.DataFrame({
-        "area_log": np.log(df["area"].astype(float)),
-        "floors": df["floors"].astype(float),
-        "ceiling": df["ceiling"].astype(float),
-        "glass_band": df["glass_band"].astype(float),
-        "climate": df["climate"].astype(float),
-        "heated_pct": df["heated_pct"].astype(float),
-        "cooled_pct": df["cooled_pct"].astype(float),
-    }, index=df.index)
-    for c in TYPE_CODES:
-        X[f"type_{c}"] = (df["type_code"] == c).astype(int)
-    for c in SHAPE_CODES:
-        X[f"shape_{c}"] = (df["shape"] == c).astype(int)
-    return X[FEATURES]
+def form_label(f):
+    return (f"Compactness {f['X1']:.2f} – height {f['X5']:.1f} m, "
+            f"surface {f['X2']:.1f} m², wall {f['X3']:.1f} m², roof {f['X4']:.2f} m²")
 
 
-def estimate_wall_area(area, floors, height):
-    """Approximate outer wall area, assuming a square footprint."""
-    footprint = area / floors
-    perimeter = 4 * math.sqrt(footprint)
-    return perimeter * height
+def make_row(form, orientation, glazing_area, distribution):
+    """One building as the 8 model features, in training order."""
+    return {"X1": form["X1"], "X2": form["X2"], "X3": form["X3"], "X4": form["X4"], "X5": form["X5"],
+            "X6": orientation, "X7": glazing_area, "X8": distribution}
 
 
-def glass_percent_to_band(pct):
-    """Convert window-to-wall % into the dataset's glass categories (1-6)."""
-    for band, upper in [(1, 1), (2, 10), (3, 25), (4, 50), (5, 75)]:
-        if pct <= upper:
-            return band
-    return 6
+def check_inputs(row, info):
+    """Return a list of problems (empty = valid). Only value combinations found in the dataset are allowed."""
+    problems = []
+    if not any(all(abs(row[k] - f[k]) < 1e-9 for k in ("X1", "X2", "X3", "X4", "X5")) for f in info["building_forms"]):
+        problems.append("Relative compactness, surface, wall and roof area and height must match one of the 12 building forms.")
+    if row["X6"] not in ORIENTATIONS:
+        problems.append("Orientation must be North, East, South or West.")
+    if row["X7"] not in GLAZING_AREAS:
+        problems.append("Glazing area must be 0%, 10%, 25% or 40%.")
+    if row["X8"] not in GLAZING_DISTRIBUTIONS:
+        problems.append("Glazing distribution must be a value from 0 to 5.")
+    if (row["X7"] == 0) != (row["X8"] == 0):
+        problems.append("Glazing distribution must be '0 – No glazing' when glazing area is 0%, "
+                        "and between 1 and 5 when there are windows.")
+    return problems
 
 
-def prepare_inputs(b):
-    """b = dict of the client's inputs. Returns (model feature row, derived values)."""
-    wall = estimate_wall_area(b["area"], b["floors"], b["height"])
-    glass_pct = min(100.0, 100 * b["glazing"] / wall) if wall > 0 else 0.0
-    ceiling = max(7.0, min(50.0, b["height"] / b["floors"]))
-    row = pd.DataFrame([{
-        "type_code": b["type_code"], "climate": b["climate"], "area": b["area"],
-        "shape": b["shape"], "glass_band": glass_percent_to_band(glass_pct),
-        "floors": min(b["floors"], 15), "ceiling": ceiling,
-        "heated_pct": b["heated_pct"], "cooled_pct": b["cooled_pct"],
-    }])
-    return make_features(row), {"wall_area": wall, "glass_pct": glass_pct, "floor_height": ceiling}
+def predict_rows(bundle, rows):
+    """Predict Heating and Cooling Load (kWh/m²) for a list of buildings."""
+    X = pd.DataFrame(rows)[bundle["features"]]          # same names and order as training
+    return [{"Y1": float(h), "Y2": float(c)}
+            for h, c in zip(bundle["models"]["Y1"].predict(X), bundle["models"]["Y2"].predict(X))]
 
 
-def predict(bundle, b):
-    """Predicted yearly heating / cooling energy in kWh per sq. ft. and in total."""
-    X, derived = prepare_inputs(b)
-    heat = max(float(bundle["models"]["Heating"].predict(X)[0]), 0.0)
-    cool = max(float(bundle["models"]["Cooling"].predict(X)[0]), 0.0)
-    return {"heat": heat, "cool": cool, "heat_total": heat * b["area"], "cool_total": cool * b["area"], **derived}
+def rank(info, target, value):
+    """Percentage of the 768 dataset buildings with a lower load than this value."""
+    loads = info["all_loads"][target]
+    return 100 * bisect.bisect_left(loads, value) / len(loads)
 
 
-def compare_level(value, typical):
-    """Compare a prediction with the typical (median) value of similar buildings."""
-    if typical <= 0.05:      # comparable buildings use almost none
-        if value <= 0.1:
-            return "Very low – same as similar buildings", "low"
-        return "Higher than similar buildings", "high"
-    ratio = value / typical
-    if ratio < 0.85:
-        return "Lower than similar buildings", "low"
-    if ratio > 1.15:
-        return "Higher than similar buildings", "high"
-    return "About the same as similar buildings", "mid"
+def level(info, target, value):
+    """Compare with the dataset quartiles: lowest 25% / middle 50% / highest 25%."""
+    q1, _, q3 = info["quartiles"][target]
+    if value < q1:
+        return "Low compared with the dataset", "low"
+    if value > q3:
+        return "High compared with the dataset", "high"
+    return "Moderate compared with the dataset", "mid"
 
 
-def get_benchmark(info, kind, type_code, climate, share_pct):
-    """Typical energy use (kWh per sq. ft.) of similar buildings in the dataset.
-    kind = "heat" or "cool"; share_pct = % of the building heated or cooled."""
-    grp = int(share_pct >= 50)
-    bench = info["benchmarks"][kind]
-    found = bench["detailed"].get(f"{type_code}_{climate}_{grp}")
-    if found and found[1] >= 15:         # enough similar buildings in the dataset
-        return found[0], "buildings of the same type in the same climate"
-    return bench["climate"][f"{climate}_{grp}"], "buildings in the same climate"
+def suggestions(bundle, info, row, result):
+    """Design suggestions tested with the same model: change one design choice at a time
+    and keep the changes that lower the total of heating + cooling load."""
+    base = result["Y1"] + result["Y2"]
+    options = []
 
+    for glaze in GLAZING_AREAS:
+        if 0 < glaze < row["X7"]:          # never suggest removing all windows (daylight is needed)
+            options.append(("Glazing area", f"Reduce glazing area from {GLAZING_AREAS[row['X7']]} to {GLAZING_AREAS[glaze]}",
+                            {**row, "X7": glaze}))
+    if row["X7"] > 0:
+        for dist in range(1, 6):
+            if dist != row["X8"]:
+                options.append(("Glazing distribution", f"Place windows as: {GLAZING_DISTRIBUTIONS[dist][4:]}",
+                                {**row, "X8": dist}))
+    for o, name in ORIENTATIONS.items():
+        if o != row["X6"]:
+            options.append(("Orientation", f"Orient the building to face {name}", {**row, "X6": o}))
+    for f in info["building_forms"]:
+        if f["X1"] != row["X1"]:
+            options.append(("Building form", f"Use the building form with compactness {f['X1']:.2f} "
+                            f"(height {f['X5']:.1f} m)", make_row(f, row["X6"], row["X7"], row["X8"])))
 
-def suggestions(b, result, heat_level, cool_level):
-    """Plain-language design suggestions based on inputs and predicted results."""
-    tips = []
-    hot_climate = b["climate"] >= 4
-    cold_climate = b["climate"] <= 2
-    glass = result["glass_pct"]
-    orient = b["orientation"]
-
-    # Glazing
-    if glass > 40:
-        tips.append(("Glazing", f"About {glass:.0f}% of the outer walls is glass, which is high. "
-                     "Large glass areas let in a lot of heat in summer and lose heat in winter. "
-                     "Consider reducing glass area, or using double-glazed / low-e (heat-reflecting) glass."))
-    elif glass < 5:
-        tips.append(("Glazing", f"Only about {glass:.0f}% of the outer walls is glass. "
-                     "This is good for energy, but check there is enough daylight inside "
-                     "so electric lights are not needed during the day."))
-    else:
-        tips.append(("Glazing", f"Glass covers about {glass:.0f}% of the outer walls, which is moderate. "
-                     "Use shading (chajjas, louvres, overhangs) above windows to block direct sun."))
-
-    # Orientation (not in the dataset – rule-of-thumb guidance)
-    if hot_climate and orient in ("East", "West", "South-West", "North-West"):
-        tips.append(("Orientation", f"The building faces {orient}. In hot climates, east and especially west "
-                     "faces receive strong low-angle sun. Keep large windows away from these sides, "
-                     "or protect them with vertical fins, trees or deep shading."))
-    elif hot_climate:
-        tips.append(("Orientation", f"Facing {orient} is generally favourable in hot climates. "
-                     "North and south windows are easier to shade than east and west windows."))
-    elif cold_climate and orient in ("South", "South-East", "South-West"):
-        tips.append(("Orientation", f"Facing {orient} helps capture winter sun in a cold climate – "
-                     "a good choice. Keep most windows on this side."))
-    else:
-        tips.append(("Orientation", "Place the main windows where they can be easily shaded in summer, "
-                     "and avoid large unshaded glass on the west side."))
-
-    # Shape / geometry
-    if b["shape"] in (5, 6, 7, 8, 9, 10, 11):
-        tips.append(("Building shape", "The building has a spread-out shape with more outer wall. "
-                     "More outer wall means more surface for heat to pass through. "
-                     "Good insulation and wall shading become more important."))
-    elif b["shape"] == 3:
-        tips.append(("Building shape", "A narrow rectangle gives good daylight and cross-ventilation. "
-                     "Keep the long sides facing north and south where possible."))
-    else:
-        tips.append(("Building shape", "A compact shape has less outer wall for its size, which helps "
-                     "reduce heat gain and heat loss."))
-
-    # Courtyard
-    if b["courtyard"] > 0:
-        ratio = 100 * b["courtyard"] / (b["area"] / b["floors"])
-        text = (f"The courtyard is about {ratio:.0f}% of the ground floor area. "
-                "A shaded courtyard with plants or water can cool surrounding rooms and bring in daylight. ")
-        if hot_climate:
-            text += "In hot climates keep it partly shaded and use it for cross-ventilation."
-        elif cold_climate:
-            text += "In cold climates, an open courtyard adds outer wall area, so insulate the walls facing it."
-        if b["shape"] != 4:
-            text += (" (Tip: you entered a courtyard area – select 'Rectangle or square with an interior "
-                     "courtyard' as the shape so the model accounts for it.)")
-        tips.append(("Courtyard", text))
-    elif hot_climate:
-        tips.append(("Courtyard", "There is no courtyard. In hot climates, a small shaded courtyard can "
-                     "improve natural ventilation and daylight."))
-
-    # Results-based tips
-    if cool_level == "high":
-        tips.append(("Cooling", "Predicted cooling need is higher than similar buildings. "
-                     "Consider a light-coloured or insulated roof, external shading, and efficient air-conditioning."))
-    if heat_level == "high":
-        tips.append(("Heating", "Predicted heating need is higher than similar buildings. "
-                     "Consider better wall and roof insulation and sealing air leaks around windows and doors."))
-    if b["height"] / b["floors"] > 14:
-        tips.append(("Height", "Floors are quite tall. Tall spaces have more air to heat or cool – "
-                     "consider ceiling fans or false ceilings in rooms that do not need the height."))
-    return tips
+    preds = predict_rows(bundle, [o[2] for o in options])
+    best = {}
+    for (group, text, _), p in zip(options, preds):
+        saving = base - (p["Y1"] + p["Y2"])
+        if saving > 0.05 and (group not in best or saving > best[group][1]):
+            best[group] = (text, saving, p)
+    tips = [(group, text, saving, 100 * saving / base, p) for group, (text, saving, p) in best.items()]
+    return sorted(tips, key=lambda t: -t[2])

@@ -2,8 +2,10 @@
 STEP 1 - Train the AI model.
 
 Run once:  python train_model.py
-It reads the CBECS 2018 dataset from the "data" folder, trains a Random Forest
-model and saves it as "model.joblib" for the app to use.
+Reads the UCI Energy Efficiency dataset (data/ENB2012_data.xlsx), trains one
+Random Forest model for Heating Load and one for Cooling Load, and saves them as
+"model.joblib" for the app to use. Reference values for the app are saved in
+"model_info.json".
 """
 import json
 
@@ -13,66 +15,44 @@ from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_absolute_error, r2_score
 from sklearn.model_selection import train_test_split
 
-from building_logic import BUILDING_TYPES, FEATURES, KBTU_TO_KWH, make_features
+from building_logic import FEATURES, TARGETS
 
-# The 12 columns used from the full CBECS file (data/cbecs2018_final_public.csv, 1,249 columns)
-DATA_FILE = "data/cbecs2018_selected_columns.csv"
+DATA_FILE = "data/ENB2012_data.xlsx"
 
-# --- 1. Load only the columns we need ---------------------------------------
-cols = ["PBA", "PUBCLIM", "SQFT", "BLDSHP", "GLSSPC", "NFLOOR", "FLCEILHT",
-        "HEATP", "COOLP", "CWUSED", "MFHTBTU", "MFCLBTU"]
-df = pd.read_csv(DATA_FILE, usecols=cols)
+# --- 1. Load the data (768 simulated buildings, 8 inputs, 2 targets) ---------
+df = pd.read_excel(DATA_FILE).dropna(how="all").dropna(axis=1, how="all")
+X = df[FEATURES]                  # X1 ... X8, in this exact order
 print(f"Buildings in dataset: {len(df)}")
 
-# --- 2. Clean the data --------------------------------------------------------
-# Building activity codes: merge the two mall types into one "shopping centre" group
-df["PBA"] = df["PBA"].replace({24: 23})
-df = df[df["PBA"].isin({code for _, code in BUILDING_TYPES})]   # keep the types offered in the app
-df = df[df["PUBCLIM"] != 7]                    # climate withheld for confidentiality
-df = df[df["FLCEILHT"] != 995]                 # ceiling height "more than 50 ft"
-df = df[df["CWUSED"] != 1]                     # district chilled water is not in the cooling totals
-df = df.dropna(subset=["MFHTBTU", "MFCLBTU"])
-df["NFLOOR"] = df["NFLOOR"].replace({994: 12, 995: 15})   # "10-14" and "15+" floors
-df[["HEATP", "COOLP"]] = df[["HEATP", "COOLP"]].fillna(0)  # blank = not heated / not cooled
+# --- 2. Same split as the project report: 80% train / 20% test, random_state=42
+X_train, X_test, y_train, y_test = train_test_split(X, df[TARGETS], test_size=0.2, random_state=42)
 
-# Targets: yearly heating / cooling energy per sq. ft., converted from kBtu to kWh
-df["heat_kwh_sqft"] = df["MFHTBTU"] * KBTU_TO_KWH / df["SQFT"]
-df["cool_kwh_sqft"] = df["MFCLBTU"] * KBTU_TO_KWH / df["SQFT"]
-print(f"Buildings used for training after cleaning: {len(df)}")
-
-X = make_features(df.rename(columns={
-    "PBA": "type_code", "PUBCLIM": "climate", "SQFT": "area", "BLDSHP": "shape",
-    "GLSSPC": "glass_band", "NFLOOR": "floors", "FLCEILHT": "ceiling",
-    "HEATP": "heated_pct", "COOLP": "cooled_pct"}))
-
-# --- 3. Train and test one model per target -----------------------------------
+# --- 3. One Random Forest per target (no scaling needed for Random Forest) ---
 models, accuracy = {}, {}
-for target, label in [("heat_kwh_sqft", "Heating"), ("cool_kwh_sqft", "Cooling")]:
-    y = df[target]
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-    model = RandomForestRegressor(n_estimators=300, min_samples_leaf=5, random_state=42, n_jobs=-1)
-    model.fit(X_train, y_train)
+for target in TARGETS:
+    model = RandomForestRegressor(n_estimators=100, random_state=42)
+    model.fit(X_train, y_train[target])
     pred = model.predict(X_test)
-    accuracy[label] = {"r2": round(r2_score(y_test, pred), 2),
-                       "mae": round(mean_absolute_error(y_test, pred), 2)}
-    print(f"{label}: R2 = {accuracy[label]['r2']}, average error = {accuracy[label]['mae']} kWh per sq. ft. per year")
-    model.fit(X, y)                                 # final model uses all the data
-    models[label] = model
+    accuracy[target] = {"r2": round(r2_score(y_test[target], pred), 4),
+                        "mae": round(mean_absolute_error(y_test[target], pred), 2)}
+    print(f"{target}: test R2 = {accuracy[target]['r2']}, average error = {accuracy[target]['mae']} kWh/m2")
+    models[target] = model         # the model evaluated above is the model the app uses
 
-# --- 4. Benchmarks: typical (median) energy use of similar buildings ---------
-# "Similar" = same type, same climate, and similar share heated (for heating) or cooled (for cooling)
-df["heat_grp"] = (df["HEATP"] >= 50).astype(int)
-df["cool_grp"] = (df["COOLP"] >= 50).astype(int)
-benchmarks = {}
-for kind, target, grp in [("heat", "heat_kwh_sqft", "heat_grp"), ("cool", "cool_kwh_sqft", "cool_grp")]:
-    detailed = df.groupby(["PBA", "PUBCLIM", grp])[target].agg(["median", "size"])
-    by_climate = df.groupby(["PUBCLIM", grp])[target].median()
-    benchmarks[kind] = {
-        "detailed": {f"{p}_{c}_{g}": [round(m, 3), int(n)] for (p, c, g), (m, n) in detailed.iterrows()},
-        "climate": {f"{c}_{g}": round(m, 3) for (c, g), m in by_climate.items()},
-    }
+# --- 4. Reference values from the dataset for the app -----------------------
+# The 12 building forms: Relative Compactness (X1) fixes X2-X5 in this dataset.
+forms = (df.groupby("X1")[["X2", "X3", "X4", "X5"]].first().reset_index()
+           .sort_values("X1", ascending=False).to_dict(orient="records"))
+info = {
+    "dataset_buildings": int(len(df)),
+    "test_buildings": int(len(X_test)),
+    "accuracy": accuracy,
+    "building_forms": forms,
+    # Sorted loads of all 768 buildings: used to rank a prediction against the dataset
+    "all_loads": {t: sorted(df[t].round(2).tolist()) for t in TARGETS},
+    "quartiles": {t: [round(df[t].quantile(q), 2) for q in (0.25, 0.5, 0.75)] for t in TARGETS},
+}
 
-joblib.dump({"models": models, "features": FEATURES}, "model.joblib", compress=3)   # compressed: under GitHub's 25 MB upload limit
+joblib.dump({"models": models, "features": FEATURES}, "model.joblib", compress=3)
 with open("model_info.json", "w") as f:
-    json.dump({"training_buildings": int(len(df)), "accuracy": accuracy, "benchmarks": benchmarks}, f, indent=1)
+    json.dump(info, f, indent=1)
 print("Saved model.joblib and model_info.json")
