@@ -33,12 +33,26 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
+def read_model():
+    """The saved model and its info, or None if missing or not trained on the 8 ENB2012 features."""
+    try:
+        bundle = joblib.load("model.joblib")
+        with open("model_info.json") as f:
+            info = json.load(f)
+    except Exception:
+        return None
+    if bundle.get("features") != FEATURES or "building_forms" not in info:
+        return None                       # e.g. files left from an older version of the app
+    return bundle, info
+
+
 @st.cache_resource(show_spinner="Loading the AI model (the first start also trains it)...")
 def load_model():
-    if not (os.path.exists("model.joblib") and os.path.exists("model_info.json")):
+    saved = read_model()
+    if saved is None:
         subprocess.run([sys.executable, "train_model.py"], check=True)   # e.g. first start online
-    with open("model_info.json") as f:
-        return joblib.load("model.joblib"), json.load(f)
+        saved = read_model()
+    return saved
 
 
 BUNDLE, INFO = load_model()
